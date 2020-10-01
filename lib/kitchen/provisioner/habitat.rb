@@ -52,6 +52,8 @@ module Kitchen
       default_config :config_directory, nil
       default_config :user_toml_name, "user.toml"
       default_config :override_package_config, false
+      default_config :provision_script_name, nil
+      default_config :cache_key_path, nil
 
       # event stream options
       default_config :event_stream_application, nil
@@ -105,6 +107,7 @@ module Kitchen
         copy_results_to_sandbox
         copy_user_toml_to_sandbox
         copy_package_config_from_override_to_sandbox
+        copy_package_signing_key_to_sandbox
       end
 
       def prepare_command
@@ -112,6 +115,7 @@ module Kitchen
         wrap_shell_code <<~PREPARE
           #{remove_previous_user_toml}
           #{copy_user_toml_to_service_directory}
+          #{provision_script}
         PREPARE
       end
 
@@ -136,7 +140,7 @@ module Kitchen
             if (!($env:Path | Select-String "Habitat")) {
               $env:Path += ";C:\\ProgramData\\Habitat"
             }
-            hab pkg install #{target_pkg} --channel #{config[:channel]} --force
+            hab pkg install #{target_pkg} #{package_options} --force
             if (Test-Path -Path "$(hab pkg path #{target_ident})\\hooks\\run") {
               hab svc load #{target_ident} #{service_options} --force
               $timer = 0
@@ -149,22 +153,19 @@ module Kitchen
           PWSH
         else
           wrap_shell_code <<~BASH
-            until sudo -E hab svc status > /dev/null
-              do
-                echo "Waiting 5 seconds for supervisor to finish loading"
-                sleep 5
+            sudo mkdir -p /hab/cache/keys
+            if [ -d /tmp/kitchen/keys ]; then
+              sudo cp -r /tmp/kitchen/keys/* /hab/cache/keys/
+            fi
+            sudo hab pkg install #{target_pkg} #{package_options} --force
+            if [ -f $(sudo hab pkg path #{target_ident})/hooks/run ]; then
+              sudo -E hab svc load #{target_ident} #{service_options} --force
+              timer=0
+              until sudo -E hab svc status | grep #{target_ident} &> /dev/null; do
+                if [ $timer -gt #{config[:service_load_timeout]} ]; then exit 1; fi
+                sleep 1
+                let "timer=timer+1"
               done
-            sudo hab pkg install #{target_pkg} --channel #{config[:channel]} --force
-            if [ -f $(sudo hab pkg path #{target_ident})/hooks/run ]
-              then
-                sudo -E hab svc load #{target_ident} #{service_options} --force
-                timer=0
-                until sudo -E hab svc status | grep #{target_ident}
-                  do
-                    if [$timer -gt #{config[:service_load_timeout]}]; then exit 1; fi
-                    sleep 1
-                    $timer++
-                  done
             fi
           BASH
         end
@@ -227,8 +228,7 @@ module Kitchen
           rm -rf /tmp/kitchen
           mkdir -p /tmp/kitchen/results
           #{"mkdir -p /tmp/kitchen/config" unless config[:override_package_config]}
-          if [ -f /etc/systemd/system/hab-sup.service ]
-          then
+          if [ -f /etc/systemd/system/hab-sup.service ]; then
             echo "Hab-sup service already exists"
           else
             echo "Starting hab-sup service install"
@@ -252,6 +252,10 @@ module Kitchen
             sudo -E systemctl daemon-reload
             sudo -E systemctl start hab-sup
             sudo -E systemctl enable hab-sup
+            until sudo -E hab svc status &> /dev/null; do
+              echo "Waiting 5 seconds for supervisor to finish loading"
+              sleep 5
+            done
           fi
         LINUX_SERVICE_SETUP
       end
@@ -297,6 +301,35 @@ module Kitchen
         )
       end
 
+      def copy_package_signing_key_to_sandbox
+        return if config[:artifact_name].nil? && !config[:install_latest_artifact]
+        results_dir = resolve_results_directory
+        return if results_dir.nil?
+
+        pkg_path = File.join(results_dir, config[:install_latest_artifact] ? latest_artifact_name : config[:artifact_name])
+        key_name = "#{IO.foreach(pkg_path).take(2)[1].strip}.pub"
+
+        keys = []
+        unless config[:cache_key_path]
+          home_key_path = File.join(File.join(File.join(File.join(ENV['HOME'], '.hab'), 'cache'), 'keys'), key_name)
+          root_key_path = File.join(File.join(File.join('hab', 'cache'), 'keys'), key_name)
+          keys = Dir[home_key_path, root_key_path]
+        else
+          keys = Dir[File.join(config[:cache_key_path], key_name)]
+        end
+
+        if keys.empty?
+          warn "Local package signing keys not found. 'hab pkg install' will search depot for keys by default."
+        else
+          sandbox_keys_path = FileUtils.mkdir_p(File.join(sandbox_path, 'keys'))[0]
+          FileUtils.mkdir_p(sandbox_keys_path)
+          keys.each do |key_path|
+          debug "Will use signing key: #{key_path}.inspect"
+            FileUtils.cp(key_path, sandbox_keys_path, preserve: true)
+          end
+        end
+      end
+
       def full_user_toml_path
         File.join(File.join(config[:kitchen_root], config[:config_directory]), config[:user_toml_name])
       end
@@ -312,6 +345,15 @@ module Kitchen
         FileUtils.mkdir_p(File.join(sandbox_path, "config"))
         debug("Copying user.toml from #{full_user_toml_path} to #{sandbox_user_toml_path}")
         FileUtils.cp(full_user_toml_path, sandbox_user_toml_path)
+      end
+
+      def full_provision_script_path
+        File.join(File.join(config[:kitchen_root], config[:config_directory]), config[:provision_script_name])
+      end
+
+      def provision_script
+        return if config[:provision_script_name].nil?
+        File.read(full_provision_script_path)
       end
 
       def latest_artifact_name
@@ -335,12 +377,12 @@ module Kitchen
         if windows_os?
           <<~PWSH
             New-Item -Path c:\\hab\\user\\#{config[:package_name]}\\config -ItemType Directory -Force  | Out-Null
-            Copy-Item -Path #{File.join(File.join(config[:root_path], "config"), "user.toml")} -Destination c:\\hab\\user\\#{config[:package_name]}\\config\\user.toml -Force
+            Copy-Item -Path #{File.join(File.join(config[:root_path], "config"), config[:user_toml_name])} -Destination c:\\hab\\user\\#{config[:package_name]}\\config\\user.toml -Force
           PWSH
         else
           <<~BASH
             sudo -E mkdir -p /hab/user/#{config[:package_name]}/config
-            sudo -E cp #{File.join(File.join(config[:root_path], "config"), "user.toml")} /hab/user/#{config[:package_name]}/config/user.toml
+            sudo -E cp #{File.join(File.join(config[:root_path], "config"), config[:user_toml_name])} /hab/user/#{config[:package_name]}/config/user.toml
           BASH
         end
       end
@@ -411,6 +453,14 @@ module Kitchen
         options
       end
 
+      def package_options
+        options = ""
+        options += " --channel #{config[:channel]}" unless config[:channel].nil?
+        options += " --url #{config[:depot_url]}" unless config[:depot_url].nil?
+
+        options
+      end
+
       def service_options
         options = ""
         options += config[:hab_sup_bind].map { |b| " --bind #{b}" }.join(" ") if config[:hab_sup_bind].any?
@@ -418,6 +468,7 @@ module Kitchen
         options += " --topology #{config[:service_topology]}" unless config[:service_topology].nil?
         options += " --strategy #{config[:service_update_strategy]}" unless config[:service_update_strategy].nil?
         options += " --channel #{config[:channel]}" unless config[:channel].nil?
+        options += " --url #{config[:depot_url]}" unless config[:depot_url].nil?
 
         options
       end

@@ -15,6 +15,8 @@ You'll need the test-kitchen & kitchen-habitat gems installed in your system, al
 
 * `hab_license`: Habitat license acceptance type (for more information please read the [chef license documentation](https://docs.chef.io/chef_license_accept.html#habitat)).
 * `hab_version`: The version of habitat to be used in test kitchen.
+* `provision_script_name`: The name of the provision script to run before Habitat package is loaded. Loaded from the provided `config_directory`.
+* `cache_key_path`: Cache for creating and searching for encryption keys. Provide the path to your key cache if your keys are not in the default location.
 
 ### Depot settings
 
